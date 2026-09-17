@@ -46,14 +46,22 @@ def _save_cached_token(access_token: str) -> None:
 
 
 def _generate_token() -> str:
-    """Call growwapi's token endpoint using TOTP or key+secret from env."""
+    """Call growwapi's token endpoint using TOTP or key+secret.
+
+    The OS credential store (via settings_store/keyring, filled in from the
+    dashboard's Settings screen) is checked first; .env is the fallback for
+    headless/CLI use, so scripts like backtest.py keep working unchanged.
+    """
     from growwapi import GrowwAPI
 
-    api_key = os.environ.get("GROWW_API_KEY")
-    api_secret = os.environ.get("GROWW_API_SECRET")
-    totp_secret = os.environ.get("GROWW_TOTP_SECRET")
+    import settings_store
+
+    creds = settings_store.load_credentials()
+    api_key = creds.get("GROWW_API_KEY") or os.environ.get("GROWW_API_KEY")
+    api_secret = creds.get("GROWW_API_SECRET") or os.environ.get("GROWW_API_SECRET")
+    totp_secret = creds.get("GROWW_TOTP_SECRET") or os.environ.get("GROWW_TOTP_SECRET")
     if not api_key:
-        raise RuntimeError("GROWW_API_KEY not set in .env")
+        raise RuntimeError("GROWW_API_KEY not set (Settings screen or .env)")
 
     if totp_secret:
         import pyotp
@@ -62,7 +70,7 @@ def _generate_token() -> str:
         return GrowwAPI.get_access_token(api_key=api_key, totp=totp)
     if api_secret:
         return GrowwAPI.get_access_token(api_key=api_key, api_secret=api_secret)
-    raise RuntimeError("Set either GROWW_TOTP_SECRET or GROWW_API_SECRET in .env")
+    raise RuntimeError("Set either GROWW_TOTP_SECRET or GROWW_API_SECRET (Settings screen or .env)")
 
 
 def get_session(force_refresh: bool = False) -> str:

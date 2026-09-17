@@ -1,9 +1,10 @@
-"""Streamlit dashboard: Scan tab (chart + proposal + approve/reject) and
-Backtest tab. Paper trading only — no live orders are ever placed here.
+"""Streamlit dashboard: Scan tab (chart + proposal + approve/reject),
+Backtest tab, and Settings tab (secure credential storage). Paper trading
+only — no live orders are ever placed here.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -11,12 +12,24 @@ import streamlit as st
 
 import config
 import controller
+import settings_store
 from analysis.indicators import ema
 from backtest.engine import run_backtest
+from notify import notify
 from paper import broker as paper_broker
+from paper import manager as paper_manager
 from providers import DemoProvider
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 st.set_page_config(page_title="Options Controller", layout="wide")
+
+
+def _is_market_hours(now: datetime) -> bool:
+    return now.weekday() < 5 and time(9, 15) <= now.time() <= time(15, 30)
 
 
 @st.cache_resource
@@ -92,17 +105,30 @@ def render_proposal(proposal: dict) -> None:
 
 def scan_tab() -> None:
     with st.sidebar:
-        st.header("Settings")
+        st.header("Controls")
         demo = st.toggle("Demo mode", value=True)
         instrument = st.selectbox("Instrument", list(config.INSTRUMENTS), index=0)
         strategy_name = st.selectbox("Strategy", config.STRATEGIES, index=0)
+        auto_refresh = st.toggle("Auto-refresh positions (30s, market hours)", value=False)
+        if auto_refresh and st_autorefresh is None:
+            st.caption("Install `streamlit-autorefresh` to enable this.")
 
     provider = get_provider(demo)
+    now = datetime.now()
+
+    if auto_refresh and st_autorefresh is not None and _is_market_hours(now):
+        st_autorefresh(interval=30_000, key="position_autorefresh")
 
     if st.button("🔍 Scan now", type="primary"):
         with st.spinner("Scanning..."):
-            st.session_state["proposal"] = controller.scan(provider, strategy_name, instrument)
+            proposal = controller.scan(provider, strategy_name, instrument)
+            st.session_state["proposal"] = proposal
             st.session_state["chart_data"] = provider.get_spot_candles(instrument, "5m", 150)
+        if proposal["tradeable"]:
+            notify(
+                "Options Controller: setup found",
+                f"{proposal['direction'].upper()} {proposal['option_symbol']} @ {proposal['entry']}",
+            )
 
     proposal = st.session_state.get("proposal")
     chart_data = st.session_state.get("chart_data")
@@ -120,6 +146,10 @@ def scan_tab() -> None:
     st.divider()
     st.subheader("Open positions")
     state = paper_broker.load_state()
+    for action in paper_manager.refresh_positions(provider, state, now):
+        st.toast(f"{action['symbol']}: {action['action']} @ {action['price']}")
+        notify("Options Controller: position update", f"{action['symbol']} {action['action']} @ {action['price']}")
+
     positions = paper_broker.get_positions(state)
     if positions:
         st.dataframe(pd.DataFrame(positions), use_container_width=True)
@@ -175,9 +205,67 @@ def backtest_tab() -> None:
         st.warning("No trades were generated over this period.")
 
 
+def settings_tab() -> None:
+    st.subheader("Groww credentials")
+    st.caption(
+        "Stored securely via your OS credential manager (Windows Credential "
+        "Manager, macOS Keychain, or the Linux Secret Service) -- never "
+        "written to a plaintext file. Demo mode works without any of this."
+    )
+
+    if not settings_store.is_available():
+        st.warning(
+            "No OS credential store is available on this machine (Windows "
+            "Credential Manager / Keychain / Secret Service), so credentials "
+            "can't be saved here. Use a .env file instead (see .env.example)."
+        )
+
+    existing = settings_store.load_credentials()
+    if settings_store.has_credentials():
+        st.success("Credentials are currently configured.")
+    else:
+        st.info("No credentials configured yet.")
+
+    api_key = st.text_input(
+        "GROWW_API_KEY", type="password",
+        placeholder="•••••••• (unchanged)" if existing["GROWW_API_KEY"] else "",
+    )
+    method = st.radio("Auth method", ["TOTP secret", "API secret"], horizontal=True)
+    totp_secret = api_secret = ""
+    if method == "TOTP secret":
+        totp_secret = st.text_input(
+            "GROWW_TOTP_SECRET", type="password",
+            placeholder="•••••••• (unchanged)" if existing["GROWW_TOTP_SECRET"] else "",
+        )
+    else:
+        api_secret = st.text_input(
+            "GROWW_API_SECRET", type="password",
+            placeholder="•••••••• (unchanged)" if existing["GROWW_API_SECRET"] else "",
+        )
+
+    col_save, col_clear = st.columns(2)
+    if col_save.button("💾 Save credentials", type="primary"):
+        saved = settings_store.save_credentials(
+            GROWW_API_KEY=api_key or existing["GROWW_API_KEY"],
+            GROWW_TOTP_SECRET=totp_secret or existing["GROWW_TOTP_SECRET"],
+            GROWW_API_SECRET=api_secret or existing["GROWW_API_SECRET"],
+        )
+        if saved:
+            st.success("Credentials saved.")
+        else:
+            st.error("Could not save: no OS credential store available on this machine.")
+        st.rerun()
+    if col_clear.button("🗑 Clear credentials"):
+        settings_store.clear_credentials()
+        st.warning("Credentials cleared.")
+        st.rerun()
+
+
 st.title("Options Controller")
-tab_scan, tab_backtest = st.tabs(["Scan", "Backtest"])
+tab_scan, tab_backtest, tab_settings = st.tabs(["Scan", "Backtest", "Settings"])
 with tab_scan:
     scan_tab()
 with tab_backtest:
     backtest_tab()
+with tab_settings:
+    settings_tab()
